@@ -1,76 +1,180 @@
-version: '2'
+version: "3.8"
+
+x-health-opts: &health-common
+  interval: 15s
+  timeout: 5s
+  retries: 20
+  start_period: 20s
+
 services:
-  jeecg-boot-mysql:
-    build:
-      context: ./jeecg-boot/db
-    environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_ROOT_HOST: '%'
-      TZ: Asia/Shanghai
-    restart: always
-    container_name: jeecg-boot-mysql
-    image: jeecg-boot-mysql
-    command:
+  mysql:
+    image: mysql:8.0
+    container_name: jeecg-mysql
+    restart: unless-stopped
+    command: >
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_general_ci
-      --explicit_defaults_for_timestamp=true
-      --lower_case_table_names=1
-      --max_allowed_packet=128M
       --default-authentication-plugin=caching_sha2_password
-    ports:
-      - 13306:3306
-    networks:
-      - jeecg-boot
-
-  jeecg-boot-redis:
-    image: registry.cn-hangzhou.aliyuncs.com/jeecgdocker/redis:5.0
-    # ports:
-    #   - 3792:6379
-    restart: always
-    hostname: jeecg-boot-redis
-    container_name: jeecg-boot-redis
-    networks:
-      - jeecg-boot
-
-  jeecg-boot-pgvector:
-    image: registry.cn-hangzhou.aliyuncs.com/jeecgdocker/pgvector
-    container_name: jeecg-boot-pgvector
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: vector_db
+      TZ: ${TZ}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     ports:
-      - 5432:5432
-    restart: always
-    networks:
-      - jeecg-boot
-      
-  jeecg-boot-system:
-    build:
-      context: ./jeecg-boot/jeecg-module-system/jeecg-system-start
-    restart: on-failure
-    depends_on:
-      - jeecg-boot-mysql
-      - jeecg-boot-redis
-    container_name: jeecg-boot-system
-    image: jeecg-boot-system
-    hostname: jeecg-boot-system
-    ports:
-      - 8080:8080
-    networks:
-      - jeecg-boot
-  jeecg-vue:
-    build:
-      context: ./jeecgboot-vue3
-    container_name: jeecgboot-vue3-nginx
-    image: jeecgboot-vue3
-    depends_on:
-      - jeecg-boot-system
-    networks:
-      - jeecg-boot
-    ports:
-      - 80:80
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      <<: *health-common
 
-networks:
-  jeecg-boot:
-    name: jeecg_boot
+  redis:
+    image: redis:7
+    container_name: jeecg-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "PING"]
+      <<: *health-common
+
+  nacos:
+    image: nacos/nacos-server:v2.4.0
+    container_name: jeecg-nacos
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      MODE: standalone
+      NACOS_AUTH_ENABLE: "true"
+      NACOS_AUTH_IDENTITY_KEY: "serverIdentity"
+      NACOS_AUTH_IDENTITY_VALUE: "security"
+      NACOS_AUTH_TOKEN: "SecretTokenForNacos"
+      SPRING_DATASOURCE_PLATFORM: mysql
+      MYSQL_SERVICE_HOST: mysql
+      MYSQL_SERVICE_DB_NAME: ${MYSQL_DATABASE}
+      MYSQL_SERVICE_PORT: "3306"
+      MYSQL_SERVICE_USER: ${MYSQL_USER}
+      MYSQL_SERVICE_PASSWORD: ${MYSQL_PASSWORD}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${NACOS_PORT}:8848"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8848/nacos/ || exit 1"]
+      <<: *health-common
+    # Nacos console will be at http://<host>:${NACOS_PORT}/nacos (default nacos/nacos).  [oai_citation:2‡Nacos 官网](https://nacos.io/en-us/docs/quick-start-docker.html?utm_source=chatgpt.com)
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: jeecg-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "${RABBITMQ_AMQP_PORT}:5672"
+      - "${RABBITMQ_HTTP_PORT}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      <<: *health-common
+
+  xxl-job-admin:
+    image: xuxueli/xxl-job-admin:3.1.1
+    container_name: jeecg-xxl-job-admin
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      PARAMS: >
+        --server.port=${XXL_ADMIN_HTTP_PORT}
+        --server.servlet.context-path=${XXL_ADMIN_CONTEXT}
+        --spring.datasource.url=jdbc:mysql://mysql:3306/${MYSQL_DATABASE}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=UTC
+        --spring.datasource.username=${MYSQL_USER}
+        --spring.datasource.password=${MYSQL_PASSWORD}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${XXL_ADMIN_HTTP_PORT}:${XXL_ADMIN_HTTP_PORT}"
+    volumes:
+      - xxl_job_logs:/data/applogs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${XXL_ADMIN_HTTP_PORT}${XXL_ADMIN_CONTEXT}/ || exit 1"]
+      <<: *health-common
+    # XXL-Job admin defaults to /xxl-job-admin and port 8080 if not overridden.  [oai_citation:3‡GitHub](https://github.com/xuxueli/xxl-job/blob/master/xxl-job-admin/src/main/resources/application.properties?utm_source=chatgpt.com)
+
+  # -------- JeecgBoot services (build from source) --------
+  # Adjust "context" paths if your clone lives elsewhere.
+  jeecg-system:
+    container_name: jeecg-system
+    restart: unless-stopped
+    build:
+      context: ./jeecg-boot/jeecg-server-cloud/jeecg-system
+      dockerfile: Dockerfile
+    environment:
+      TZ: ${TZ}
+      SERVER_PORT: ${SYSTEM_PORT}
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=UTC
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD}
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: 6379
+      SPRING_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # Nacos (discovery + config)
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+      # XXL-Job (optional; set according to your project config)
+      XXL_JOB_ADMIN_ADDRESSES: http://xxl-job-admin:${XXL_ADMIN_HTTP_PORT}${XXL_ADMIN_CONTEXT}
+      XXL_JOB_ACCESS_TOKEN: ""
+    depends_on:
+      nacos:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${SYSTEM_PORT}:${SYSTEM_PORT}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${SYSTEM_PORT}/actuator/health || exit 1"]
+      <<: *health-common
+
+  jeecg-gateway:
+    container_name: jeecg-gateway
+    restart: unless-stopped
+    build:
+      context: ./jeecg-boot/jeecg-server-cloud/jeecg-gateway
+      dockerfile: Dockerfile
+    environment:
+      TZ: ${TZ}
+      SERVER_PORT: ${GATEWAY_PORT}
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: 6379
+      SPRING_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # Nacos
+      SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR: nacos:8848
+      SPRING_CLOUD_NACOS_CONFIG_SERVER_ADDR: nacos:8848
+    depends_on:
+      jeecg-system:
+        condition: service_started
+      nacos:
+        condition: service_healthy
+    ports:
+      - "${GATEWAY_PORT}:${GATEWAY_PORT}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${GATEWAY_PORT}/actuator/health || exit 1"]
+      <<: *health-common
+
+volumes:
+  mysql_data:
+  redis_data:
+  rabbitmq_data:
+  xxl_job_logs:
